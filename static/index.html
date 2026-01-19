@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GopherID - Secure SSO</title>
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
     <style>
         body { background-color: #f8f9fa; }
         .jwt-part { word-break: break-all; font-family: monospace; }
@@ -18,7 +19,7 @@
 
 <nav class="navbar navbar-dark bg-dark mb-4">
     <div class="container">
-        <span class="navbar-brand mb-0 h1"><a href="/" class="h1 text-decoration-none">🔐 GopherID Identity Provider</a></span>
+        <span class="navbar-brand mb-0 h1"><a href="/" class="h1 text-decoration-none text-light">🔐 GopherID Identity Provider</a></span>
         <div>
             <a href="/openapi.json" class="btn btn-outline-light btn-sm me-2">API Spec</a>
         </div>
@@ -26,7 +27,7 @@
 </nav>
 
 <div class="container">
-    
+
     <div class="row justify-content-center" id="login-card">
         <div class="col-md-5">
             <div class="card shadow-sm">
@@ -66,19 +67,34 @@
                     <div class="card-body">
                         <h1 class="display-6">Welcome, <span id="user-name">...</span>!</h1>
                         <span class="badge bg-secondary mb-3" id="user-role-badge">Role: User</span>
-                        
+
                         <hr>
-                        
-                        <div class="d-grid gap-2">
-                            <button class="btn btn-outline-danger" onclick="getFlag()">
-                                🔓 Access Admin Flag
-                            </button>
-                            <button class="btn btn-outline-secondary" onclick="logout()">
-                                Logout
-                            </button>
+
+                        <div class="card mb-3 bg-light border-warning">
+                            <div class="card-body text-center p-2">
+                                <h6 class="card-title text-warning-emphasis">Two-Factor Authentication</h6>
+                                <button class="btn btn-sm btn-warning w-100 mb-2" onclick="setupMFA()">
+                                    🔄 Setup / Reset MFA
+                                </button>
+
+                                <div id="qrcode" class="d-flex justify-content-center my-2"></div>
+                                <div id="secret-display" class="small font-monospace text-muted text-break"></div>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Admin Flag Access</label>
+                            <div class="input-group">
+                                <input type="text" id="mfa-input" class="form-control" placeholder="Enter 6-digit MFA Code">
+                                <button class="btn btn-danger" onclick="getFlag()">Get Flag</button>
+                            </div>
+                            <div class="form-text text-muted">MFA is required for this action.</div>
                         </div>
 
                         <div id="flag-output" class="mt-3 alert alert-secondary" style="display:none;"></div>
+
+                        <hr>
+                        <button class="btn btn-outline-secondary w-100" onclick="logout()">Logout</button>
                     </div>
                 </div>
             </div>
@@ -91,7 +107,7 @@
                     </div>
                     <div class="card-body bg-light">
                         <p class="small text-muted">Current Session Token (JWT):</p>
-                        
+
                         <div class="card mb-3">
                             <div class="card-body p-2 small">
                                 <span id="raw-header" class="header-part fw-bold"></span>.<span id="raw-payload" class="payload-part fw-bold"></span>.<span id="raw-sig" class="signature-part text-muted">...</span>
@@ -108,7 +124,7 @@
                                 <pre class="console-bg p-2 rounded" id="decoded-payload">{}</pre>
                             </div>
                         </div>
-                        
+
                         <div class="alert alert-info d-flex align-items-center mt-2" role="alert">
                             <svg class="bi flex-shrink-0 me-2" width="24" height="24" role="img" aria-label="Info:"><use xlink:href="#info-fill"/></svg>
                             <small>
@@ -158,27 +174,67 @@
         }
     }
 
+    // New Function: Calls the Setup Endpoint and Renders QR
+    async function setupMFA() {
+        const qrContainer = document.getElementById("qrcode");
+        const secretDisplay = document.getElementById("secret-display");
+
+        qrContainer.innerHTML = ""; // Clear previous
+        secretDisplay.innerText = "Generating keys...";
+
+        try {
+            const res = await fetch('/api/mfa/setup', {
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + currentToken }
+            });
+
+            if (res.ok) {
+                const data = await res.json();
+                if(data.url) {
+                    new QRCode(qrContainer, {
+                        text: data.url,
+                        width: 128,
+                        height: 128
+                    });
+                    secretDisplay.innerText = "Secret: " + (data.secret || "Hidden");
+                }
+            } else {
+                secretDisplay.innerText = "Error: " + res.statusText;
+            }
+        } catch(e) {
+            secretDisplay.innerText = "Connection Failed";
+        }
+    }
+
+    // Modified Function: Includes MFA Header
     async function getFlag() {
         const output = document.getElementById("flag-output");
+        const mfaCode = document.getElementById("mfa-input").value; // Read input
+
         output.style.display = "block";
         output.innerText = "Verifying permissions...";
         output.className = "mt-3 alert alert-secondary";
 
         try {
             const res = await fetch("/api/flag", {
-                headers: { Authorization: "Bearer " + currentToken }
+                headers: {
+                    "Authorization": "Bearer " + currentToken,
+                    "X-MFA-Code": mfaCode // Send the header
+                }
             });
 
+            const data = await res.json();
+
             if (res.ok) {
-                const data = await res.json();
                 output.className = "mt-3 alert alert-success fw-bold";
                 output.innerText = data.message;
             } else {
                 output.className = "mt-3 alert alert-danger";
-                output.innerText = "Access Denied: You need admin role privileges.";
+                // Display the specific error message from the server (e.g. "Invalid MFA Code")
+                output.innerText = data.message || "Access Denied.";
             }
         } catch (e) {
-            output.innerText = "Error connecting to server.";
+            output.innerText = `Error connecting to server: ${e}`;
         }
     }
 
@@ -198,9 +254,10 @@
         document.getElementById("decoded-payload").innerText = JSON.stringify(payload, null, 2);
 
         document.getElementById("user-name").innerText = payload.username;
-        const badge = document.getElementById(user-role-badge);
+
+        const badge = document.getElementById("user-role-badge");
         badge.innerText = "Role: " + payload.role;
-        badge.className = payload.role === admin ? "badge bg-danger mb-3" : "badge bg-secondary mb-3";
+        badge.className = payload.role === "admin" ? "badge bg-danger mb-3" : "badge bg-secondary mb-3";
     }
 
     function logout() {
@@ -211,8 +268,12 @@
         document.getElementById("flag-output").style.display = "none";
         document.getElementById("username").value = "";
         document.getElementById("password").value = "";
+        document.getElementById("qrcode").innerHTML = ""; // Clear QR
+        document.getElementById("secret-display").innerText = "";
+        document.getElementById("mfa-input").value = "";
     }
 </script>
 
+<!-- https://github.com/mspraggs/gopherid -->
 </body>
 </html>

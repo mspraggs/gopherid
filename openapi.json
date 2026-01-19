@@ -37,13 +37,85 @@
         "responses": { "200": { "description": "Returns public keys" } }
       }
     },
+    "/api/mfa/setup": {
+      "post": {
+        "summary": "Setup or Reset MFA",
+        "description": "Generates a new MFA secret for the user. Returns a TOTP secret and a QR code URL. WARNING: Resets existing MFA configuration.",
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "MFA Setup Complete",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    },
+                    "secret": {
+                      "type": "string",
+                      "description": "The Base32 TOTP secret"
+                    },
+                    "url": {
+                      "type": "string",
+                      "description": "URL for QR Code generation (otpauth://...)"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/flag": {
       "get": {
         "summary": "Get Flag",
-        "security": [ { "BearerAuth": [] } ],
-        "responses": { 
-          "200": { "description": "The Flag" },
-          "403": { "description": "Forbidden" }
+        "description": "Returns the flag. Requires 'admin' role in JWT AND a valid TOTP code in the header.",
+        "parameters": [
+          {
+            "name": "X-MFA-Code",
+            "in": "header",
+            "description": "Current 6-digit Time-based OTP code",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "example": "123456"
+            }
+          }
+        ],
+        "security": [
+          {
+            "BearerAuth": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The Flag",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "message": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid MFA Code or Token"
+          },
+          "403": {
+            "description": "Forbidden (Requires Admin Role)"
+          }
         }
       }
     }

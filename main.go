@@ -15,9 +15,11 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/pquerna/otp/totp"
 )
 
 var (
@@ -25,7 +27,10 @@ var (
 	privateKey     *rsa.PrivateKey
 	publicKey      *rsa.PublicKey
 	publicKeyBytes []byte // The raw PKIX bytes (The "Secret")
-	flag           = func() string {
+	// Map[Username]MFA_Secret_String
+	// We use sync.Map for memory safety, but the LOGIC is still racy.
+	mfaStore sync.Map
+	flag     = func() string {
 		f, err := os.Open("flag.txt")
 		if err != nil {
 			panic(err)
@@ -82,6 +87,7 @@ func main() {
 
 	// API
 	http.HandleFunc("/api/login", LoginHandler)
+	http.HandleFunc("/api/mfa/setup", AuthMiddleware(MFASetupHandler))
 	http.HandleFunc("/api/flag", AuthMiddleware(FlagHandler))
 
 	// Standard JWKS Endpoint
@@ -90,8 +96,6 @@ func main() {
 	log.Println("Server started on :8080")
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
-
-// -- VULNERABLE MIDDLEWARE --
 
 func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -104,7 +108,6 @@ func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 		token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (any, error) {
 
-			// --- VULNERABILITY: KEY CONFUSION ---
 			// If alg is HS256, we use the Public Key BYTES as the HMAC secret.
 			if token.Method.Alg() == "HS256" {
 				return publicKeyBytes, nil
@@ -118,7 +121,7 @@ func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		})
 
 		if err != nil || !token.Valid {
-			http.Error(w, "Invalid Token", http.StatusUnauthorized)
+			http.Error(w, `{"message":"Invalid Token"}`, http.StatusUnauthorized)
 			return
 		}
 
@@ -129,6 +132,82 @@ func AuthMiddleware(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // -- HANDLERS --
+
+func MFASetupHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+	claims := getClaims(r.Context())
+
+	// 1. Set "Pending" State (The Trap)
+	// We use a known string as the secret temporarily.
+	// Note: Base32 requires specific charset, so we use a valid Base32 string.
+	// "MFAINITPENDING" is valid base32 (letters A-Z, numbers 2-7).
+	tempSecret := "MFAINITPENDING23"
+	mfaStore.Store(claims.Username, tempSecret)
+
+	// Simulate "Generating Secure Crypto Keys"
+	time.Sleep(800 * time.Millisecond)
+
+	// 3. Generate Real Secret
+	key, err := totp.Generate(totp.GenerateOpts{
+		Issuer:      "GopherID",
+		AccountName: claims.Username,
+	})
+	if err != nil {
+		http.Error(w, `{"message": "Crypto Error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	// 4. Overwrite with Real Secret
+	mfaStore.Store(claims.Username, key.Secret())
+
+	// Return the URL so the Frontend can generate a QR Code
+	newSecret := rand.Text()
+	json.NewEncoder(w).Encode(map[string]string{
+		"message": "MFA Setup Complete",
+		"secret":  newSecret,
+		"url":     strings.ReplaceAll(key.URL(), key.Secret(), newSecret),
+	})
+}
+
+func FlagHandler(w http.ResponseWriter, r *http.Request) {
+	claims := getClaims(r.Context())
+
+	// 1. JWT Check (Bypassed via Key Confusion)
+	if claims.Role != "admin" {
+		http.Error(w, `{"message":"Forbidden: Admins only"}`, http.StatusForbidden)
+		return
+	}
+
+	// 2. MFA Check
+	// Retrieve the user's secret from memory
+	val, ok := mfaStore.Load(claims.Username)
+	if !ok {
+		http.Error(w, `{"message":"MFA Not Setup. Please configure 2FA."}`, http.StatusForbidden)
+		return
+	}
+	secret := val.(string)
+
+	// Get the user's code from the Header
+	userCode := r.Header.Get("X-MFA-Code")
+	if userCode == "" {
+		http.Error(w, `{"message":"Missing X-MFA-Code header"}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Validate TOTP
+	// If hit during race window, secret is "MFAINITPENDING"
+	valid := totp.Validate(userCode, secret)
+
+	if !valid {
+		http.Error(w, `{"message":"Invalid MFA Code"}`, http.StatusUnauthorized)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]string{"message": flag})
+}
 
 func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 	// Convert RSA key parts to JWKS format (Base64URL encoded Big Ints)
@@ -159,20 +238,20 @@ func JWKSHandler(w http.ResponseWriter, r *http.Request) {
 
 func LoginHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, `{"message":"Method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
 	var creds LoginRequest
 	// We try to decode JSON body
 	if err := json.NewDecoder(r.Body).Decode(&creds); err != nil {
-		http.Error(w, "Invalid request format", http.StatusBadRequest)
+		http.Error(w, `{"message":"Invalid request format"}`, http.StatusBadRequest)
 		return
 	}
 
 	// Logic Hint: You cannot simply "log in" as admin.
 	if creds.Username == "admin" {
-		http.Error(w, "Admin login is restricted to internal consoles only.", http.StatusForbidden)
+		http.Error(w, `{"message":"Admin login is restricted to internal consoles only."}`, http.StatusForbidden)
 		return
 	}
 
@@ -197,20 +276,11 @@ func LoginHandler(w http.ResponseWriter, r *http.Request) {
 
 	tokenString, err := token.SignedString(privateKey)
 	if err != nil {
-		http.Error(w, "Signing Error", http.StatusInternalServerError)
+		http.Error(w, `{"message":"Signing Error"}`, http.StatusInternalServerError)
 		return
 	}
 
 	json.NewEncoder(w).Encode(map[string]string{"token": tokenString})
-}
-
-func FlagHandler(w http.ResponseWriter, r *http.Request) {
-	claims := getClaims(r.Context())
-	if claims.Role == "admin" {
-		json.NewEncoder(w).Encode(map[string]string{"message": flag})
-	} else {
-		http.Error(w, "Forbidden: Admins only", http.StatusForbidden)
-	}
 }
 
 // -- HELPERS --
